@@ -34,7 +34,7 @@ setup(
     },
     python_requires='>=2.7.10,!=3.0.*,!=3.1.*,<4',
     classifiers=(
-        "Programming Language :: Python :: 2",
+        "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
