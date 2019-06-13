@@ -1,2 +1,2 @@
-from mbed import main
+from mbed.mbed import main
 main()
