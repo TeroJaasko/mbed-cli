@@ -42,6 +42,7 @@ import platform
 import contextlib
 import shutil
 import stat
+import tempfile
 import errno
 import ctypes
 from itertools import chain, repeat
@@ -191,6 +192,7 @@ def error(msg, code=-1):
     for line in lines:
         log("       %s\n" % line, True)
     log("---\n", True)
+    traceback.print_tb()
     sys.exit(code)
 
 def offline_warning(offline, top=True):
@@ -1268,39 +1270,45 @@ class Repo(object):
             cache = self.get_cache(url, scm.name)
 
             # Try to clone with cache ref first
-            if cache and not os.path.isdir(path):
-                info("Found matching cached repository in \"%s\"" % cache)
-                try:
-                    if os.path.split(path)[0] and not os.path.isdir(os.path.split(path)[0]):
-                        os.makedirs(os.path.split(path)[0])
+            if cache:
 
-                    info("Carbon copy from \"%s\" to \"%s\"" % (cache, path))
-                    with self.cache_lock_held(url):
-                        shutil.copytree(cache, path)
+                info("locking PID %d.., cache %s, path %s" % (os.getpid(), cache, path))
+                with self.cache_lock_held(url):
+                    info("cache locked PID %d.., cache %s, path %s" % (os.getpid(), cache, path))
+                    if not os.path.isdir(path):
+                        info("Found matching cached repository in \"%s\"" % cache)
+                        try:
+                            if os.path.split(path)[0] and not os.path.isdir(os.path.split(path)[0]):
+                                os.makedirs(os.path.split(path)[0])
 
-                    #
-                    # If no revision was specified, use the branch associated with the cache. In the
-                    # github case this will be the default branch (IOTBTOOL-279)
-                    #
-                    if not rev:
-                        with cd(cache):
-                            branch = scm.getbranch()
-                            if branch:
-                                rev = branch
-                            else:
-                                # Can't find the cache branch; use a sensible default
-                                rev = scm.default_branch
+                            info("Carbon copy from \"%s\" to \"%s\"" % (cache, path))
+                            shutil.copytree(cache, path)
+                            info("copy locked PID %d..done" % os.getpid())
 
-                    with cd(path):
-                        scm.seturl(formaturl(url, protocol))
-                        scm.cleanup()
-                        info("Update cached copy from remote repository")
-                        scm.update(rev, True, is_local=offline)
-                        main = False
-                except (ProcessException, IOError):
-                    info("Discarding cached repository")
-                    if os.path.isdir(path):
-                        rmtree_readonly(path)
+                            #
+                            # If no revision was specified, use the branch associated with the cache. In the
+                            # github case this will be the default branch (IOTBTOOL-279)
+                            #
+                            if not rev:
+                                with cd(cache):
+                                    branch = scm.getbranch()
+                                    if branch:
+                                        rev = branch
+                                    else:
+                                        # Can't find the cache branch; use a sensible default
+                                        rev = scm.default_branch
+
+                            with cd(path):
+                                scm.seturl(formaturl(url, protocol))
+                                scm.cleanup()
+                                info("Update cached copy from remote repository")
+                                scm.update(rev, True, is_local=offline)
+                                main = False
+                        except (ProcessException, IOError):
+                            info("Discarding cached repository")
+                            if os.path.isdir(path):
+                                rmtree_readonly(path)
+                    info("cache unlocking PID %d.., cache %s, path %s" % (os.getpid(), cache, path))
 
             # Main clone routine if the clone with cache ref failed (might occur if cache ref is dirty)
             if main:
@@ -1401,6 +1409,30 @@ class Repo(object):
                 warning("Unable to cache \"%s\" to \"%s\"" % (self.path, cpath))
         return False
 
+    @contextlib.contextmanager
+    def make_temp_pid_file(self, lock_dir):
+
+        #fh = tempfile.NamedTemporaryFile(mode='wb+', suffix='', prefix='.mbed-cli-pid-', dir=lock_dir)
+        fh, tmp = tempfile.mkstemp(suffix='', prefix='.mbed-cli-pid-', dir=lock_dir)
+
+        try:
+            with os.fdopen(fh, "wb+") as f:
+                info("Writing cache lock temp file %s for pid %s" % (tmp, os.getpid()))
+                f.write(str(os.getpid()))
+                f.flush()
+                os.fsync(f)
+            yield tmp
+        finally:
+            info("finally %s" % tmp)
+            try:
+                os.unlink(tmp)
+            except OSError as e:
+                if e.errno == errno.ENOENT:
+                    info("temp file not there anymore, all ok")
+                else:
+                    error("remove failed, e: %d" % e.errno)
+                    raise e
+
     def cache_lock(self, url):
         cpath = self.url2cachedir(url)
         if not cpath:
@@ -1409,82 +1441,92 @@ class Repo(object):
         if not os.path.isdir(cpath):
             os.makedirs(cpath)
 
-        lock_dir = os.path.join(cpath, '.lock')
-        lock_file = os.path.join(lock_dir, 'pid')
+        lock_dir = cpath
+        lock_file = os.path.join(lock_dir, '.mbed-cli-pid')
         timeout = 300
 
-        for i in range(timeout):
-            if i:
-                time.sleep(1)
+        info("cache_lock(%s)" % lock_file)
 
-            if os.path.exists(lock_dir):
+        with self.make_temp_pid_file(lock_dir) as tmp:
+
+            info("temp(%s)" % tmp)
+
+            for i in range(timeout):
+                if i:
+                    time.sleep(1)
+
+                attempt_locking = False
+
                 try:
-                    if os.path.isfile(lock_file):
-                        with open(lock_file, 'r') as f:
-                            pid = f.read(8)
-                        if not pid:
-                            if int(os.path.getmtime(lock_file)) + timeout < int(time.time()):
-                                info("Cache lock file exists, but is empty. Cleaning up")
-                                os.remove(lock_file)
-                                os.rmdir(lock_dir)
-                        elif int(pid) != os.getpid() and self.pid_exists(pid):
-                            info("Cache lock file exists and process %s is alive." % pid)
-                        else:
-                            info("Cache lock file exists, but %s is dead. Cleaning up" % pid)
+                    with open(lock_file, 'r') as f:
+                        pid = f.read(8)
+                    if not pid:
+                        if int(os.path.getmtime(lock_file)) + timeout < int(time.time()):
+                            info("Cache lock file exists, but is empty. Cleaning up")
                             os.remove(lock_file)
-                            os.rmdir(lock_dir)
+                    elif int(pid) == os.getpid():
+                        # todo: check hostname+PID to cover Docker's PID issue
+                        info("Cache lock file exists and it is me %s." % pid)
+                        return True
+                    elif int(pid) != os.getpid() and self.pid_exists(pid):
+                        info("Cache lock file exists and process %s is alive." % pid)
                     else:
-                        os.rmdir(lock_dir)
+                        info("Cache lock file exists, but %s is dead. Cleaning up" % pid)
+                        os.remove(lock_file)
                     continue
-                except (OSError) as e:
-                    continue
-            else:
-                try:
-                    os.mkdir(lock_dir)
-                    with open(lock_file, 'w') as f:
-                        info("Writing cache lock file %s for pid %s" % (lock_file, os.getpid()))
-                        f.write(str(os.getpid()))
-                        f.flush()
-                        os.fsync(f)
-                    break
-                except (OSError) as e:
+
+                except (IOError, OSError) as e:
                     ## Windows:
                     ##   <type 'exceptions.WindowsError'>    17 [Error 183] Cannot create a file when that file already exists: 'testing'
                     ##   or when concurrent:                 13 WindowsError(5, 'Access is denied')
                     ## Linux:    <type 'exceptions.OSError'> 17 [Errno 17] File exists: 'testing'
                     ##   or when concurrent & virtualbox     71, OSError(71, 'Protocol error')
-                    ##   or when full:                       28, OSError(28, 'No space left on device')
-                    if e.errno in (17,13,71,28):
-                        continue
+                    ## ENOENT          No such file or directory (POSIX.1-2001).
+                    if e.errno == errno.ENOENT:
+                        # all ok, no lock file
+                        info("there is no lock file")
+                        attempt_locking = True
                     else:
+                        warning("open failed, e: %d" % e.errno)
                         raise e
-        else:
+
+                if attempt_locking:
+                    try:
+                        info("link %s to %s .." % (tmp, lock_file))
+                        os.link(tmp, lock_file)
+                        info("link %s to %s succeeded" % (tmp, lock_file))
+                    except (OSError) as e:
+                        ## Windows:
+                        ##   <type 'exceptions.WindowsError'>    17 [Error 183] Cannot create a file when that file already exists: 'testing'
+                        ##   or when concurrent:                 13 WindowsError(5, 'Access is denied')
+                        ## Linux:    <type 'exceptions.OSError'> 17 [Errno 17] File exists: 'testing'
+                        ##   or when concurrent & virtualbox     71, OSError(71, 'Protocol error')
+                        ##   or when full:                       28, OSError(28, 'No space left on device')
+                        if e.errno in (17,13,71,28):
+                            continue
+                        else:
+                            raise e
             error("Exceeded 5 minutes limit while waiting for other process to finish caching")
-        return True
+            return False
 
     def cache_unlock(self, url):
         cpath = self.url2cachedir(url)
         if not cpath:
             return False
 
-        lock_dir = os.path.join(cpath, '.lock')
-        lock_file = os.path.join(lock_dir, 'pid')
+        lock_dir = os.path.join(cpath)
+        lock_file = os.path.join(lock_dir, '.mbed-cli-pid')
+
+        info("cache_unlock(%s)" % lock_file)
+
         try:
-            if os.path.exists(lock_dir):
-                if os.path.isfile(lock_file):
-                    try:
-                        with open(lock_file, 'r') as f:
-                            pid = f.read(8)
-                        if int(pid) != os.getpid():
-                            error("Cache lock file exists with a different pid (\"%s\" vs \"%s\")" % (pid, os.getpid()))
-                        else:
-                            info("Cache lock file exists with my pid (\"%s\"). Cleaning up." % (pid))
-                    except OSError:
-                        error("Unable to unlock cache dir \"%s\"" % (cpath))
-                    os.remove(lock_file)
-                os.rmdir(lock_dir)
+            os.remove(lock_file)
         except (OSError) as e:
+            warning("remove failed, e: %d" % e.errno)
             pass
+
+        info("cache_unlock(%s) ok" % lock_file)
+
         return True
 
     @contextmanager
@@ -3453,6 +3495,7 @@ def main():
                 "Could not detect one of the command-line tools.\n"
                 "You could retry the last command with \"-v\" flag for verbose output\n", e.args[0])
         else:
+            traceback.print_exc()
             error('OS Error: %s' % e.args[1], e.args[0])
     except KeyboardInterrupt:
         info('User aborted!', -1)
