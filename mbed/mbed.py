@@ -192,7 +192,6 @@ def error(msg, code=-1):
     for line in lines:
         log("       %s\n" % line, True)
     log("---\n", True)
-    traceback.print_tb()
     sys.exit(code)
 
 def offline_warning(offline, top=True):
@@ -1412,7 +1411,7 @@ class Repo(object):
     @contextlib.contextmanager
     def make_temp_pid_file(self, lock_dir):
 
-        #fh = tempfile.NamedTemporaryFile(mode='wb+', suffix='', prefix='.mbed-cli-pid-', dir=lock_dir)
+        # This creates a temp file with '0600' permissions, which is a bit concerning on CI use.
         fh, tmp = tempfile.mkstemp(suffix='', prefix='.mbed-cli-pid-', dir=lock_dir)
 
         try:
@@ -1420,6 +1419,12 @@ class Repo(object):
                 info("Writing cache lock temp file %s for pid %s" % (tmp, os.getpid()))
                 f.write(str(os.getpid()))
                 f.flush()
+
+                # Fixup the permissions to allow group access, so the cache is usable/shareable
+                # for the group, not just current user.
+                # XXX: is this correct thing to do, or should we rely on umask or even have some configurable?
+                os.fchmod(fh, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP)
+
                 os.fsync(f)
             yield tmp
         finally:
@@ -1490,6 +1495,9 @@ class Repo(object):
                         warning("open failed, e: %d" % e.errno)
                         raise e
 
+                # Locking is done atomically by linking the temp-file into a lock-file. If target exists, this will fail.
+                # XXX: this needs separate paths on Linux/Windows, as there is no link() on Windows, hence rename() needs to be used,
+                # and on Linux the rename() will overwrite the target, which is really not what is wanted here.
                 if attempt_locking:
                     try:
                         info("link %s to %s .." % (tmp, lock_file))
@@ -1520,12 +1528,13 @@ class Repo(object):
         info("cache_unlock(%s)" % lock_file)
 
         try:
-            os.remove(lock_file)
+            os.unlink(lock_file)
+            info("cache_unlock(%s) ok" % lock_file)
         except (OSError) as e:
+            # It is not a fatal error if lock file is left there, this may happen on Windows at least
+            # if some other program (eg. malware scanner or file sync) opens the file. It will become a
+            # problem on next lock attempt, if the file is not close until then.
             warning("remove failed, e: %d" % e.errno)
-            pass
-
-        info("cache_unlock(%s) ok" % lock_file)
 
         return True
 
