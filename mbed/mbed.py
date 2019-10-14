@@ -1496,8 +1496,13 @@ class Repo(object):
                         raise e
 
                 # Locking is done atomically by linking the temp-file into a lock-file. If target exists, this will fail.
+                #
                 # XXX: this needs separate paths on Linux/Windows, as there is no link() on Windows, hence rename() needs to be used,
                 # and on Linux the rename() will overwrite the target, which is really not what is wanted here.
+                #
+                # Linux's lockfile_create()'s algorithm (which claims to work on NFS) ignores link() failure completely,
+                # and do a stat() to verify results. Perhaps it should be done here too, instead of ignoring some and relying on the
+                # file content on next iteration.
                 if attempt_locking:
                     try:
                         info("link %s to %s .." % (tmp, lock_file))
